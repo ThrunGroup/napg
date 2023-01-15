@@ -129,7 +129,7 @@ public:
     size_t seed;
     size_t default_ef;
     bool useNormFactor;
-
+    
     bool index_inited;
     bool ep_added;
     bool normalize;
@@ -154,6 +154,7 @@ public:
         cur_l = 0;
         appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, M, efConstruction, random_seed, dim,
         useNormFactor);
+
         index_inited = true;
         ep_added = false;
         appr_alg->ef_ = default_ef;
@@ -505,7 +506,6 @@ public:
                 new_index->seed,
                 (size_t)dim_,
                 useNormFactor_);
-
             new_index->cur_l = d["cur_element_count"].cast<size_t>();
         }
 
@@ -600,7 +600,7 @@ public:
                 memcpy(appr_alg->linkLists_[i], link_list_npy.data() + link_npy_offsets[i], linkListSize);
             }
         }
-
+        
         // set num_deleted
         appr_alg->num_deleted_ = 0;
         bool has_deletions = d["has_deletions"].cast<bool>();
@@ -710,6 +710,7 @@ public:
                 data_numpy_d,                         // the data pointer
                 free_when_done_d),
             budget);
+
     }
 
     void markDeleted(size_t label)
