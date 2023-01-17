@@ -1016,29 +1016,6 @@ namespace hnswlib
             return;
         }
 
-        template <typename data_t>
-        std::vector<data_t> getDataByLabel(labeltype label) const
-        {
-            tableint label_c;
-            auto search = label_lookup_.find(label);
-            if (search == label_lookup_.end() || isMarkedDeleted(search->second))
-            {
-                throw std::runtime_error("Label not found");
-            }
-            label_c = search->second;
-
-            char *data_ptrv = getDataByInternalId(label_c);
-            size_t dim = *((size_t *)dist_func_param_);
-            std::vector<data_t> data;
-            data_t *data_ptr = (data_t *)data_ptrv;
-            for (int i = 0; i < dim; i++)
-            {
-                data.push_back(*data_ptr);
-                data_ptr += 1;
-            }
-            return data;
-        }
-
         static const unsigned char DELETE_MARK = 0x01;
         // static const unsigned char REUSE_MARK = 0x10;
         /**
@@ -1154,22 +1131,6 @@ namespace hnswlib
                 // Checking if the element with the same label already exists
                 // if so, updating it *instead* of creating a new element.
                 std::unique_lock<std::mutex> templock_curr(cur_element_count_guard_);
-                auto search = label_lookup_.find(label);
-                if (search != label_lookup_.end())
-                {
-                    tableint existingInternalId = search->second;
-                    templock_curr.unlock();
-
-                    std::unique_lock<std::mutex> lock_el_update(link_list_update_locks_[(existingInternalId & (max_update_element_locks - 1))]);
-
-                    if (isMarkedDeleted(existingInternalId))
-                    {
-                        unmarkDeletedInternal(existingInternalId);
-                    }
-                    updatePoint(data_point, existingInternalId, 1.0);
-
-                    return existingInternalId;
-                }
 
                 if (cur_element_count >= max_elements_)
                 {
