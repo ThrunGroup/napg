@@ -48,7 +48,7 @@ namespace hnswlib
 
         std::unordered_map<labeltype, size_t> dict_external_to_internal;
 
-        void addPoint(const void *datapoint, labeltype label)
+        void addPoint(const float *datapoint, labeltype label)
         {
 
             int idx;
@@ -90,7 +90,7 @@ namespace hnswlib
         }
 
         std::priority_queue<std::pair<dist_t, labeltype>>
-        searchKnn(const void *query_data, size_t k) const
+        searchKnn(const void *query_data, size_t k)
         {
             std::priority_queue<std::pair<dist_t, labeltype>> topResults;
             if (cur_element_count == 0)

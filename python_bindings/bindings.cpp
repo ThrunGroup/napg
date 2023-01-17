@@ -92,7 +92,8 @@ template <typename dist_t, typename data_t = float>
 class Index
 {
 public:
-    Index(const std::string &space_name, const int dim) : space_name(space_name), dim(dim)
+    Index(const std::string &space_name, const size_t dim, const bool useNormFactor_) : space_name(space_name), dim(dim)
+    , useNormFactor(useNormFactor_)
     {
         normalize = false;
         if (space_name == "l2")
@@ -118,15 +119,17 @@ public:
         num_threads_default = std::thread::hardware_concurrency();
 
         default_ef = 10;
+        useNormFactor = useNormFactor_;
     }
 
     static const int ser_version = 1; // serialization version
 
     std::string space_name;
-    int dim;
+    size_t dim;
     size_t seed;
     size_t default_ef;
-
+    bool useNormFactor;
+    
     bool index_inited;
     bool ep_added;
     bool normalize;
@@ -150,7 +153,8 @@ public:
         }
         cur_l = 0;
         appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, M, efConstruction, random_seed, dim,
-                                                        useNormFactor);
+        useNormFactor);
+
         index_inited = true;
         ep_added = false;
         appr_alg->ef_ = default_ef;
@@ -189,10 +193,10 @@ public:
     void normalize_vector(float *data, float *norm_array)
     {
         float norm = 0.0f;
-        for (int i = 0; i < dim; i++)
+        for (size_t i = 0; i < dim; i++)
             norm += data[i] * data[i];
         norm = 1.0f / (sqrtf(norm) + 1e-30f);
-        for (int i = 0; i < dim; i++)
+        for (size_t i = 0; i < dim; i++)
             norm_array[i] = data[i] * norm;
     }
 
@@ -251,7 +255,6 @@ public:
         }
 
         {
-
             int start = 0;
             if (!ep_added)
             {
@@ -263,9 +266,19 @@ public:
                     normalize_vector(vector_data, norm_array.data());
                     vector_data = norm_array.data();
                 }
-                appr_alg->addPoint((void *)vector_data, (size_t)id);
+                appr_alg->addPoint((float *)vector_data, (size_t)id);
                 start = 1;
                 ep_added = true;
+            }
+
+            if (useNormFactor) {
+                // Add data to dataset and calculate the adjusting factors
+                for(int row = 0; row<rows; row++) {
+                  appr_alg->addData((float *)items.data(row), dim);
+                }
+
+                // Calculate norm ranged based factors
+                appr_alg->getNormRangeBasedFactors();
             }
 
             py::gil_scoped_release l;
@@ -274,7 +287,7 @@ public:
                 ParallelFor(start, rows, num_threads, [&](size_t row, size_t threadId)
                             {
                     size_t id = ids.size() ? ids.at(row) : (cur_l+row);
-                    appr_alg->addPoint((void *) items.data(row), (size_t) id); });
+                    appr_alg->addPoint((float *)items.data(row), (size_t)id); });
             }
             else
             {
@@ -286,7 +299,7 @@ public:
                     normalize_vector((float *) items.data(row), (norm_array.data()+start_idx));
 
                     size_t id = ids.size() ? ids.at(row) : (cur_l+row);
-                    appr_alg->addPoint((void *) (norm_array.data()+start_idx), (size_t) id); });
+                    appr_alg->addPoint((float *)(norm_array.data() + start_idx), (size_t)id); });
             };
             cur_l += rows;
         }
@@ -456,7 +469,8 @@ public:
             "ep_added"_a = ep_added,
             "normalize"_a = normalize,
             "num_threads"_a = num_threads_default,
-            "seed"_a = seed);
+            "seed"_a = seed,
+            "useNormFactor"_a = useNormFactor);
 
         if (index_inited == false)
             return py::dict(**params, "ef"_a = default_ef);
@@ -472,10 +486,11 @@ public:
         assert_true(((int)py::int_(Index<float>::ser_version)) >= d["ser_version"].cast<int>(), "Invalid serialization version!");
 
         auto space_name_ = d["space"].cast<std::string>();
-        auto dim_ = d["dim"].cast<int>();
+        auto dim_ = d["dim"].cast<size_t>();
         auto index_inited_ = d["index_inited"].cast<bool>();
+        auto useNormFactor_ = d["useNormFactor"].cast<bool>();
 
-        Index<float> *new_index = new Index<float>(space_name_, dim_);
+        Index<float> *new_index = new Index<float>(space_name_, dim_, useNormFactor_);
 
         /*  TODO: deserialize state of random generators into new_index->level_generator_ and new_index->update_probability_generator_  */
         /*        for full reproducibility / state of generators is serialized inside Index::getIndexParams                      */
@@ -483,7 +498,14 @@ public:
 
         if (index_inited_)
         {
-            new_index->appr_alg = new hnswlib::HierarchicalNSW<dist_t>(new_index->l2space, d["max_elements"].cast<size_t>(), d["M"].cast<size_t>(), d["ef_construction"].cast<size_t>(), new_index->seed);
+            new_index->appr_alg = new hnswlib::HierarchicalNSW<dist_t>(
+                new_index->l2space,
+                d["max_elements"].cast<size_t>(),
+                d["M"].cast<size_t>(),
+                d["ef_construction"].cast<size_t>(),
+                new_index->seed,
+                (size_t)dim_,
+                useNormFactor_);
             new_index->cur_l = d["cur_element_count"].cast<size_t>();
         }
 
@@ -578,7 +600,7 @@ public:
                 memcpy(appr_alg->linkLists_[i], link_list_npy.data() + link_npy_offsets[i], linkListSize);
             }
         }
-
+        
         // set num_deleted
         appr_alg->num_deleted_ = 0;
         bool has_deletions = d["has_deletions"].cast<bool>();
@@ -633,7 +655,7 @@ public:
             {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId)
                             {
-                                std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                                std::priority_queue<std::pair<dist_t, hnswlib::labeltype>> result = appr_alg->searchKnn(
                                         (void *) items.data(row), k);
                                 if (result.size() != k)
                                     throw std::runtime_error(
@@ -673,6 +695,8 @@ public:
         py::capsule free_when_done_d(data_numpy_d, [](void *f)
                                      { delete[] f; });
 
+        size_t budget = appr_alg->budgets;
+
         return py::make_tuple(
             py::array_t<hnswlib::labeltype>(
                 {rows, k}, // shape
@@ -684,7 +708,9 @@ public:
                 {rows, k},                            // shape
                 {k * sizeof(dist_t), sizeof(dist_t)}, // C-style contiguous strides for double
                 data_numpy_d,                         // the data pointer
-                free_when_done_d));
+                free_when_done_d),
+            budget);
+
     }
 
     void markDeleted(size_t label)
@@ -805,43 +831,43 @@ public:
         std::vector<size_t> ids;
 
         if (!ids_.is_none())
-        {
-            py::array_t<size_t, py::array::c_style | py::array::forcecast> items(ids_);
-            auto ids_numpy = items.request();
-            if (ids_numpy.ndim == 1 && ids_numpy.shape[0] == rows)
-            {
-                std::vector<size_t> ids1(ids_numpy.shape[0]);
-                for (size_t i = 0; i < ids1.size(); i++)
-                {
-                    ids1[i] = items.data()[i];
-                }
-                ids.swap(ids1);
-            }
-            else if (ids_numpy.ndim == 0 && rows == 1)
-            {
-                ids.push_back(*items.data());
-            }
-            else
-                throw std::runtime_error("wrong dimensionality of the labels");
-        }
-        {
+          {
+              py::array_t<size_t, py::array::c_style | py::array::forcecast> items(ids_);
+              auto ids_numpy = items.request();
+              if (ids_numpy.ndim == 1 && ids_numpy.shape[0] == rows)
+              {
+                  std::vector<size_t> ids1(ids_numpy.shape[0]);
+                  for (size_t i = 0; i < ids1.size(); i++)
+                  {
+                      ids1[i] = items.data()[i];
+                  }
+                  ids.swap(ids1);
+              }
+              else if (ids_numpy.ndim == 0 && rows == 1)
+              {
+                  ids.push_back(*items.data());
+              }
+              else
+                  throw std::runtime_error("wrong dimensionality of the labels");
+          }
+          {
 
-            for (size_t row = 0; row < rows; row++)
-            {
-                size_t id = ids.size() ? ids.at(row) : cur_l + row;
-                if (!normalize)
-                {
-                    alg->addPoint((void *)items.data(row), (size_t)id);
-                }
-                else
-                {
-                    std::vector<float> normalized_vector(dim);
-                    normalize_vector((float *)items.data(row), normalized_vector.data());
-                    alg->addPoint((void *)normalized_vector.data(), (size_t)id);
-                }
-            }
-            cur_l += rows;
-        }
+              for (size_t row = 0; row < rows; row++)
+              {
+                  size_t id = ids.size() ? ids.at(row) : cur_l + row;
+                  if (!normalize)
+                  {
+                      alg->addPoint((float *)items.data(row), (size_t)id);
+                  }
+                  else
+                  {
+                      std::vector<float> normalized_vector(dim);
+                      normalize_vector((float *)items.data(row), normalized_vector.data());
+                      alg->addPoint((float *)normalized_vector.data(), (size_t)id);
+                  }
+              }
+              cur_l += rows;
+          }
     }
 
     void deleteVector(size_t label)
@@ -935,7 +961,8 @@ PYBIND11_PLUGIN(hnswlib)
         .def(py::init(&Index<float>::createFromParams), py::arg("params"))
         /* WARNING: Index::createFromIndex is not thread-safe with Index::addItems */
         .def(py::init(&Index<float>::createFromIndex), py::arg("index"))
-        .def(py::init<const std::string &, const int>(), py::arg("space"), py::arg("dim"))
+        .def(py::init<const std::string &, const int, const bool>(), py::arg("space"), py::arg("dim"), py::arg
+        ("useNormFactor_"))
         .def("init_index", &Index<float>::init_new_index, py::arg("max_elements"), py::arg("M") = 16, py::arg("ef_construction") = 200, py::arg("random_seed") = 100)
         .def("knn_query", &Index<float>::knnQuery_return_numpy, py::arg("data"), py::arg("k") = 1, py::arg("num_threads") = -1)
         .def("add_items", &Index<float>::addItems, py::arg("data"), py::arg("ids") = py::none(), py::arg("num_threads") = -1)

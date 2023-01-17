@@ -173,12 +173,12 @@ namespace hnswlib
     class AlgorithmInterface
     {
     public:
-        virtual void addPoint(const void *datapoint, labeltype label) = 0;
-        virtual std::priority_queue<std::pair<dist_t, labeltype>> searchKnn(const void *, size_t) const = 0;
+        virtual void addPoint(const float *datapoint, labeltype label) = 0;
+        virtual std::priority_queue<std::pair<dist_t, labeltype>> searchKnn(const void *, size_t) = 0;
 
         // Return k nearest neighbor in the order of closer fist
         virtual std::vector<std::pair<dist_t, labeltype>>
-        searchKnnCloserFirst(const void *query_data, size_t k) const;
+        searchKnnCloserFirst(const void *query_data, size_t k);
 
         virtual void saveIndex(const std::string &location) = 0;
         virtual ~AlgorithmInterface()
@@ -188,7 +188,7 @@ namespace hnswlib
 
     template <typename dist_t>
     std::vector<std::pair<dist_t, labeltype>>
-    AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void *query_data, size_t k) const
+    AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void *query_data, size_t k)
     {
         std::vector<std::pair<dist_t, labeltype>> result;
 

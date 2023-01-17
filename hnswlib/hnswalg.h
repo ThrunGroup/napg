@@ -8,6 +8,15 @@
 #include <assert.h>
 #include <unordered_set>
 #include <list>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <stdlib.h>
+#include <unordered_map>
+#include <utility>
+#include <omp.h>
+#include <chrono>
+
 
 namespace hnswlib
 {
@@ -19,19 +28,21 @@ namespace hnswlib
     {
     public:
         static const tableint max_update_element_locks = 65536;
+
         HierarchicalNSW(SpaceInterface<dist_t> *s)
         {
         }
 
         HierarchicalNSW(SpaceInterface<dist_t> *s, const std::string &location, bool nmslib = false, size_t max_elements = 0)
         {
-            loadIndex(location, s, max_elements);
         }
 
-        HierarchicalNSW(SpaceInterface<dist_t> *s, size_t max_elements, size_t M = 16, size_t ef_construction = 200, size_t random_seed = 100) : link_list_locks_(max_elements), link_list_update_locks_(max_update_element_locks), element_levels_(max_elements)
+        HierarchicalNSW(SpaceInterface<dist_t> *s, size_t max_elements, size_t M = 16, size_t ef_construction = 200,
+        size_t random_seed = 100, size_t dim = 10, bool useNormFactor = false) : link_list_locks_(max_elements),
+        link_list_update_locks_
+        (max_update_element_locks), element_levels_(max_elements)
         {
             max_elements_ = max_elements;
-
             num_deleted_ = 0;
             data_size_ = s->get_data_size();
             fstdistfunc_ = s->get_dist_func();
@@ -69,6 +80,10 @@ namespace hnswlib
             size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
             mult_ = 1 / log(1.0 * M_);
             revSize_ = 1.0 / mult_;
+
+            budgets = 0;
+            dim_ = dim;
+            useNormFactor_ = useNormFactor;
         }
 
         struct CompareByFirst
@@ -134,6 +149,15 @@ namespace hnswlib
         std::default_random_engine level_generator_;
         std::default_random_engine update_probability_generator_;
 
+        // Variables for NAPG
+        size_t budgets;  // Track how much computation is used
+        size_t dim_;  // Dimension of the data
+        std::vector<std::vector<float>> dataset;  // Store data before constructing the graph to calculate the factors
+        bool useNormFactor_;  // Whether to use NAPG or not
+        int num_subranges = 5;  // Number of subranges
+        float range_start_norms[5];  // Norms of the first data in each subrange
+        float factors[5];  // Adjusting factors for each subrange
+
         inline labeltype getExternalLabel(tableint internal_id) const
         {
             labeltype return_label;
@@ -163,6 +187,199 @@ namespace hnswlib
             return (int)r;
         }
 
+        template <typename data_t>
+        std::vector<data_t> getDataByLabel(labeltype label) const
+        {
+            tableint label_c;
+            auto search = label_lookup_.find(label);
+            if (search == label_lookup_.end() || isMarkedDeleted(search->second))
+            {
+                throw std::runtime_error("Label not found");
+            }
+            label_c = search->second;
+
+            char *data_ptrv = getDataByInternalId(label_c);
+            size_t dim = *((size_t *)dist_func_param_);
+            std::vector<data_t> data;
+            data_t *data_ptr = (data_t *)data_ptrv;
+            for (int i = 0; i < dim; i++)
+            {
+                data.push_back(*data_ptr);
+                data_ptr += 1;
+            }
+            return data;
+        }
+
+        /// @brief Calculate the norm 2 of a vector.
+        /// @param vec Vector to calculate the norm.
+        /// @return Norm 2 of vec.
+        static float vectorNorm(std::vector<float> vec)
+        {
+            float sum = 0.0;
+            for (float x : vec)
+            {
+                sum += x * x;
+            }
+            return sqrt(sum);
+        }
+
+        /// @brief Append data to a list inside this class in order to calculate the adjusting factors.
+        /// @param data One data point to add.
+        /// @param dim Dimension size of the data.
+        void addData(const float *data, size_t dim)
+        {
+          std::vector<float> data_list;
+          for(int d = 0; d<dim; d++) {
+            data_list.push_back(data[d]);
+          }
+          dataset.push_back(data_list);
+        }
+
+        /// @brief Compare the norm 2 of two vectors. This method is used to sort `dataset`.
+        /// @param data1 First vector to compare.
+        /// @param data2 Second vector to compare.
+        /// @return True if the first vector is smaller than the second vector.
+        static bool compareNorm(std::vector<float> data1, std::vector<float> data2)
+        {
+            return (vectorNorm(data1) < vectorNorm(data2));
+        }
+
+        /// @brief Get the adjusting factor of a data point according to its norm
+        /// @param internalId Id of the data point
+        /// @return Adjusting factor of the data point
+        float getFactor(tableint internalId)
+        {
+            size_t dim = *((size_t *)dist_func_param_);
+            char *data_ptrv = getDataByInternalId(internalId);
+            std::vector<float> data;
+            float *data_ptr = (float *)data_ptrv;
+            for (int i = 0; i < dim; i++)
+            {
+                data.push_back(*data_ptr);
+                data_ptr += 1;
+            }
+
+            float norm = vectorNorm(data);
+
+            // get which range it belongs to
+            int range_index = 0;
+
+            for (int i = 1; i < 5; i++)
+            {
+                if (norm >= range_start_norms[i])
+                    range_index = i;
+            }
+
+            return factors[range_index];
+        }
+
+        static int getRandomIndice(int low, int high)
+        {
+            return low + rand() % (high - low + 1);
+        }
+
+        /**
+         * @brief Calculate the norm ranged based adjusting factors for each range
+         *
+         * 1. Partition the dataset into sub-ranges in ascending order of the norms
+         * 2. For each sub-range, sample a few data points (x) to use a query, get items that have largest inner products
+         *      with them (p)
+         * 3. Calculate the average of inner product values between all x and their p : xp_mean
+         * 4. Calculate the average of inner product values among all x's p : pp_mean
+         */
+        void getNormRangeBasedFactors()
+        {
+            size_t num_data = max_elements_;
+
+            // Sort data by norm in ascending order
+            sort(dataset.begin(), dataset.end(), compareNorm);
+
+            // Divide by range
+            int index = 0;
+            int range_start_indices[num_subranges + 1];
+
+            for (int i = 0; i < num_subranges; i++)
+            {
+                range_start_indices[i] = index;
+                range_start_norms[i] = vectorNorm(dataset[index]);
+                index += int(num_data / num_subranges);
+            }
+            range_start_indices[num_subranges] = num_data - 1;
+
+            // For each range, get a norm-based factor
+            int num_samples = 50;
+            int num_neighbours = 100;
+            std::vector<float> query;
+            std::vector<float> neighbours[num_neighbours];
+
+            for (int i = 0; i < num_subranges; i++)
+            {
+                float xp_sum = 0;
+                float pp_sum = 0;
+
+                #pragma omp parallel for reduction(+:xp_sum,pp_sum)
+                for (int sample_index = 0; sample_index < num_samples; sample_index++)
+                {
+                    int random_indice = getRandomIndice(range_start_indices[i], range_start_indices[i + 1]);
+                    query = dataset[random_indice];
+
+                    // get nearest neighbours (p)
+                    std::priority_queue<std::pair<dist_t, int>, std::vector<std::pair<dist_t, int>>, CompareByFirst> nearest_neighbours;
+                    for (int n=0; n<dataset.size(); n++) {
+                      // get inner product
+                      float inner_product = 0;
+                      for (unsigned d = 0; d < dim_; d += 4) {
+                        // Used faster for loop to accelerate this method
+                        inner_product += query[d] * dataset[n][d] +
+                                        query[d+1] * dataset[n][d+1] +
+                                        query[d+2] * dataset[n][d+2] +
+                                        query[d+3] * dataset[n][d+3];
+                      }
+                      nearest_neighbours.emplace(inner_product, n);
+                    }
+
+                    for (int n=0; n<num_neighbours; n++) {
+                      neighbours[n] = dataset[nearest_neighbours.top().second];
+
+                      // get x * p
+                      for (int d = 0; d < dim_; d += 4)
+                      {
+                        xp_sum += query[d] * neighbours[n][d] +
+                                    query[d+1] * neighbours[n][d+1] +
+                                    query[d+2] * neighbours[n][d+2] +
+                                    query[d+3] * neighbours[n][d+3];
+                      }
+                      nearest_neighbours.pop();
+                    }
+
+                    // Get p_i * p_j
+                    for (int m = 0; m < num_neighbours; m++)
+                    {
+                        for (int n = 0; n < num_neighbours; n++)
+                        {
+                            if (m != n)
+                            {
+                                #pragma omp parallel for reduction(+:pp_sum)
+                                for (int d = 0; d < dim_; d += 4)
+                                {
+                                    pp_sum += neighbours[m][d] * neighbours[n][d] +
+                                              neighbours[m][d+1] * neighbours[n][d+1] +
+                                              neighbours[m][d+2] * neighbours[n][d+2] +
+                                              neighbours[m][d+3] * neighbours[n][d+3];
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Get factor
+                float pp_mean = pp_sum / ((num_neighbours-1) * (num_neighbours-1));
+                float xp_mean = xp_sum / num_neighbours;
+
+                factors[i] = pp_mean / xp_mean;
+            }
+        }
+        
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
         searchBaseLayer(tableint ep_id, const void *data_point, int layer)
         {
@@ -201,7 +418,7 @@ namespace hnswlib
 
                 std::unique_lock<std::mutex> lock(link_list_locks_[curNodeNum]);
 
-                int *data; // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
+                int *data;
                 if (layer == 0)
                 {
                     data = (int *)get_linklist0(curNodeNum);
@@ -209,9 +426,9 @@ namespace hnswlib
                 else
                 {
                     data = (int *)get_linklist(curNodeNum, layer);
-                    //                    data = (int *) (linkLists_[curNodeNum] + (layer - 1) * size_links_per_element_);
                 }
-                size_t size = getListCount((linklistsizeint *)data);
+                size_t size = getListCount((linklistsizeint *)data);  // number of linked nodes
+
                 tableint *datal = (tableint *)(data + 1);
 #ifdef USE_SSE
                 _mm_prefetch((char *)(visited_array + *(data + 1)), _MM_HINT_T0);
@@ -223,7 +440,6 @@ namespace hnswlib
                 for (size_t j = 0; j < size; j++)
                 {
                     tableint candidate_id = *(datal + j);
-//                    if (candidate_id == 0) continue;
 #ifdef USE_SSE
                     _mm_prefetch((char *)(visited_array + *(datal + j + 1)), _MM_HINT_T0);
                     _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
@@ -262,7 +478,8 @@ namespace hnswlib
 
         template <bool has_deletions, bool collect_metrics = false>
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
-        searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef) const
+
+        searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef)
         {
             VisitedList *vl = visited_list_pool_->getFreeVisitedList();
             vl_type *visited_array = vl->mass;
@@ -275,6 +492,7 @@ namespace hnswlib
             if (!has_deletions || !isMarkedDeleted(ep_id))
             {
                 dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+                this->budgets += dim_;
                 lowerBound = dist;
                 top_candidates.emplace(dist, ep_id);
                 candidate_set.emplace(-dist, ep_id);
@@ -331,6 +549,7 @@ namespace hnswlib
 
                         char *currObj1 = (getDataByInternalId(candidate_id));
                         dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                        this->budgets += dim_;
 
                         if (top_candidates.size() < ef || lowerBound > dist)
                         {
@@ -384,14 +603,19 @@ namespace hnswlib
                 queue_closest.pop();
                 bool good = true;
 
+                if (useNormFactor_) {
+                    float factor = getFactor(curent_pair.second);
+                    dist_to_query *= factor;
+                }
+
                 for (std::pair<dist_t, tableint> second_pair : return_list)
                 {
                     dist_t curdist =
                         fstdistfunc_(getDataByInternalId(second_pair.second),
                                      getDataByInternalId(curent_pair.second),
-                                     dist_func_param_);
+                                     dist_func_param_);  // similarity between PiPj
                     ;
-                    if (curdist < dist_to_query)
+                    if (dist_to_query < curdist)
                     {
                         good = false;
                         break;
@@ -518,6 +742,7 @@ namespace hnswlib
                     else
                     {
                         // finding the "weakest" element to replace it with the new one
+                        // distance btw query and current neighbour
                         dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
                                                     dist_func_param_);
                         // Heuristic:
@@ -525,6 +750,8 @@ namespace hnswlib
                         candidates.emplace(d_max, cur_c);
 
                         for (size_t j = 0; j < sz_link_list_other; j++)
+                        // neighbours of the current neighbour
+                        // candidates: priority queue in the order of neighbour's similarity
                         {
                             candidates.emplace(
                                 fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(selectedNeighbors[idx]),
@@ -543,18 +770,6 @@ namespace hnswlib
                         }
 
                         setListCount(ll_other, indx);
-                        // Nearest K:
-                        /*int indx = -1;
-                        for (int j = 0; j < sz_link_list_other; j++) {
-                            dist_t d = fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(rez[idx]), dist_func_param_);
-                            if (d > d_max) {
-                                indx = j;
-                                d_max = d;
-                            }
-                        }
-                        if (indx >= 0) {
-                            data[indx] = cur_c;
-                        } */
                     }
                 }
             }
@@ -916,170 +1131,9 @@ namespace hnswlib
             *((unsigned short int *)(ptr)) = *((unsigned short int *)&size);
         }
 
-        void addPoint(const void *data_point, labeltype label)
+        void addPoint(const float *data_point, labeltype label)
         {
             addPoint(data_point, label, -1);
-        }
-
-        void updatePoint(const void *dataPoint, tableint internalId, float updateNeighborProbability)
-        {
-            // update the feature vector associated with existing point with new vector
-            memcpy(getDataByInternalId(internalId), dataPoint, data_size_);
-
-            int maxLevelCopy = maxlevel_;
-            tableint entryPointCopy = enterpoint_node_;
-            // If point to be updated is entry point and graph just contains single element then just return.
-            if (entryPointCopy == internalId && cur_element_count == 1)
-                return;
-
-            int elemLevel = element_levels_[internalId];
-            std::uniform_real_distribution<float> distribution(0.0, 1.0);
-            for (int layer = 0; layer <= elemLevel; layer++)
-            {
-                std::unordered_set<tableint> sCand;
-                std::unordered_set<tableint> sNeigh;
-                std::vector<tableint> listOneHop = getConnectionsWithLock(internalId, layer);
-                if (listOneHop.size() == 0)
-                    continue;
-
-                sCand.insert(internalId);
-
-                for (auto &&elOneHop : listOneHop)
-                {
-                    sCand.insert(elOneHop);
-
-                    if (distribution(update_probability_generator_) > updateNeighborProbability)
-                        continue;
-
-                    sNeigh.insert(elOneHop);
-
-                    std::vector<tableint> listTwoHop = getConnectionsWithLock(elOneHop, layer);
-                    for (auto &&elTwoHop : listTwoHop)
-                    {
-                        sCand.insert(elTwoHop);
-                    }
-                }
-
-                for (auto &&neigh : sNeigh)
-                {
-                    // if (neigh == internalId)
-                    //     continue;
-
-                    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
-                    size_t size = sCand.find(neigh) == sCand.end() ? sCand.size() : sCand.size() - 1; // sCand guaranteed to have size >= 1
-                    size_t elementsToKeep = std::min(ef_construction_, size);
-                    for (auto &&cand : sCand)
-                    {
-                        if (cand == neigh)
-                            continue;
-
-                        dist_t distance = fstdistfunc_(getDataByInternalId(neigh), getDataByInternalId(cand), dist_func_param_);
-                        if (candidates.size() < elementsToKeep)
-                        {
-                            candidates.emplace(distance, cand);
-                        }
-                        else
-                        {
-                            if (distance < candidates.top().first)
-                            {
-                                candidates.pop();
-                                candidates.emplace(distance, cand);
-                            }
-                        }
-                    }
-
-                    // Retrieve neighbours using heuristic and set connections.
-                    getNeighborsByHeuristic2(candidates, layer == 0 ? maxM0_ : maxM_);
-
-                    {
-                        std::unique_lock<std::mutex> lock(link_list_locks_[neigh]);
-                        linklistsizeint *ll_cur;
-                        ll_cur = get_linklist_at_level(neigh, layer);
-                        size_t candSize = candidates.size();
-                        setListCount(ll_cur, candSize);
-                        tableint *data = (tableint *)(ll_cur + 1);
-                        for (size_t idx = 0; idx < candSize; idx++)
-                        {
-                            data[idx] = candidates.top().second;
-                            candidates.pop();
-                        }
-                    }
-                }
-            }
-
-            repairConnectionsForUpdate(dataPoint, entryPointCopy, internalId, elemLevel, maxLevelCopy);
-        };
-
-        void repairConnectionsForUpdate(const void *dataPoint, tableint entryPointInternalId, tableint dataPointInternalId, int dataPointLevel, int maxLevel)
-        {
-            tableint currObj = entryPointInternalId;
-            if (dataPointLevel < maxLevel)
-            {
-                dist_t curdist = fstdistfunc_(dataPoint, getDataByInternalId(currObj), dist_func_param_);
-                for (int level = maxLevel; level > dataPointLevel; level--)
-                {
-                    bool changed = true;
-                    while (changed)
-                    {
-                        changed = false;
-                        unsigned int *data;
-                        std::unique_lock<std::mutex> lock(link_list_locks_[currObj]);
-                        data = get_linklist_at_level(currObj, level);
-                        int size = getListCount(data);
-                        tableint *datal = (tableint *)(data + 1);
-#ifdef USE_SSE
-                        _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
-#endif
-                        for (int i = 0; i < size; i++)
-                        {
-#ifdef USE_SSE
-                            _mm_prefetch(getDataByInternalId(*(datal + i + 1)), _MM_HINT_T0);
-#endif
-                            tableint cand = datal[i];
-                            dist_t d = fstdistfunc_(dataPoint, getDataByInternalId(cand), dist_func_param_);
-                            if (d < curdist)
-                            {
-                                curdist = d;
-                                currObj = cand;
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (dataPointLevel > maxLevel)
-                throw std::runtime_error("Level of item to be updated cannot be bigger than max level");
-
-            for (int level = dataPointLevel; level >= 0; level--)
-            {
-                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> topCandidates = searchBaseLayer(
-                    currObj, dataPoint, level);
-
-                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> filteredTopCandidates;
-                while (topCandidates.size() > 0)
-                {
-                    if (topCandidates.top().second != dataPointInternalId)
-                        filteredTopCandidates.push(topCandidates.top());
-
-                    topCandidates.pop();
-                }
-
-                // Since element_levels_ is being used to get `dataPointLevel`, there could be cases where `topCandidates` could just contains entry point itself.
-                // To prevent self loops, the `topCandidates` is filtered and thus can be empty.
-                if (filteredTopCandidates.size() > 0)
-                {
-                    bool epDeleted = isMarkedDeleted(entryPointInternalId);
-                    if (epDeleted)
-                    {
-                        filteredTopCandidates.emplace(fstdistfunc_(dataPoint, getDataByInternalId(entryPointInternalId), dist_func_param_), entryPointInternalId);
-                        if (filteredTopCandidates.size() > ef_construction_)
-                            filteredTopCandidates.pop();
-                    }
-
-                    currObj = mutuallyConnectNewElement(dataPoint, dataPointInternalId, filteredTopCandidates, level, true);
-                }
-            }
         }
 
         std::vector<tableint> getConnectionsWithLock(tableint internalId, int level)
@@ -1093,9 +1147,8 @@ namespace hnswlib
             return result;
         };
 
-        tableint addPoint(const void *data_point, labeltype label, int level)
+        tableint addPoint(const float *data_point, labeltype label, int level)
         {
-
             tableint cur_c = 0;
             {
                 // Checking if the element with the same label already exists
@@ -1160,14 +1213,12 @@ namespace hnswlib
 
             if ((signed)currObj != -1)
             {
-
                 if (curlevel < maxlevelcopy)
                 {
-
+                    // distance of ep to q
                     dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
                     for (int level = maxlevelcopy; level > curlevel; level--)
                     {
-
                         bool changed = true;
                         while (changed)
                         {
@@ -1194,8 +1245,7 @@ namespace hnswlib
                         }
                     }
                 }
-
-                bool epDeleted = isMarkedDeleted(enterpoint_copy);
+                
                 for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--)
                 {
                     if (level > maxlevelcopy || level < 0) // possible?
@@ -1203,12 +1253,6 @@ namespace hnswlib
 
                     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
                         currObj, data_point, level);
-                    if (epDeleted)
-                    {
-                        top_candidates.emplace(fstdistfunc_(data_point, getDataByInternalId(enterpoint_copy), dist_func_param_), enterpoint_copy);
-                        if (top_candidates.size() > ef_construction_)
-                            top_candidates.pop();
-                    }
                     currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false);
                 }
             }
@@ -1229,7 +1273,7 @@ namespace hnswlib
         };
 
         std::priority_queue<std::pair<dist_t, labeltype>>
-        searchKnn(const void *query_data, size_t k) const
+        searchKnn(const void *query_data, size_t k)
         {
             std::priority_queue<std::pair<dist_t, labeltype>> result;
             if (cur_element_count == 0)
@@ -1237,6 +1281,7 @@ namespace hnswlib
 
             tableint currObj = enterpoint_node_;
             dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+             this->budgets += dim_;
 
             for (int level = maxlevel_; level > 0; level--)
             {
@@ -1258,7 +1303,8 @@ namespace hnswlib
                         if (cand < 0 || cand > max_elements_)
                             throw std::runtime_error("cand error");
                         dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
-
+                        this->budgets += dim_;
+                        
                         if (d < curdist)
                         {
                             curdist = d;
@@ -1332,5 +1378,4 @@ namespace hnswlib
             std::cout << "integrity ok, checked " << connections_checked << " connections\n";
         }
     };
-
 }
