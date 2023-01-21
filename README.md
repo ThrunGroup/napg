@@ -181,7 +181,7 @@ p = hnswlib.Index(space='l2', dim=dim)  # possible options are l2, cosine or ip
 # during insertion of an element.
 # The capacity can be increased by saving/loading the index, see below.
 #
-# ef_construction - controls index search speed/build speed tradeoff
+# ef_construction - controls index search speed/build speed speedup_accuracy_tradeoff
 #
 # M - is tightly connected with internal dimensionality of the data. Strongly affects memory consumption (~M)
 # Higher M leads to higher accuracy/run_time at fixed ef/efConstruction

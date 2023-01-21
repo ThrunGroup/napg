@@ -23,7 +23,7 @@ class RandomSelfTestCase(unittest.TestCase):
         # max_elements - the maximum number of elements, should be known beforehand
         #     (probably will be made optional in the future)
         #
-        # ef_construction - controls index search speed/build speed tradeoff
+        # ef_construction - controls index search speed/build speed speedup_accuracy_tradeoff
         # M - is tightly connected with internal dimensionality of the data
         #     strongly affects the memory consumption
 

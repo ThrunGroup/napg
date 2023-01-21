@@ -19,7 +19,7 @@ bf_index = hnswlib.BFIndex(space='l2', dim=dim)
 # The capacity can be increased by saving/loading the index, see below.
 #
 # hnsw construction params:
-# ef_construction - controls index search speed/build speed tradeoff
+# ef_construction - controls index search speed/build speed speedup_accuracy_tradeoff
 #
 # M - is tightly connected with internal dimensionality of the data. Strongly affects the memory consumption (~M)
 # Higher M leads to higher accuracy/run_time at fixed ef/efConstruction

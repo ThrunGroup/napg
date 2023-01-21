@@ -154,7 +154,7 @@ namespace hnswlib
         size_t dim_;  // Dimension of the data
         std::vector<std::vector<float>> dataset;  // Store data before constructing the graph to calculate the factors
         bool useNormFactor_;  // Whether to use NAPG or not
-        int num_subranges = 5;  // Number of subranges
+        const int num_subranges = 5;  // Number of subranges
         float range_start_norms[5];  // Norms of the first data in each subrange
         float factors[5];  // Adjusting factors for each subrange
 
@@ -308,7 +308,7 @@ namespace hnswlib
 
             // For each range, get a norm-based factor
             int num_samples = 50;
-            int num_neighbours = 100;
+            const int num_neighbours = 100;
             std::vector<float> query;
             std::vector<float> neighbours[num_neighbours];
 
@@ -540,7 +540,7 @@ namespace hnswlib
 #ifdef USE_SSE
                     _mm_prefetch((char *)(visited_array + *(data + j + 1)), _MM_HINT_T0);
                     _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                 _MM_HINT_T0); ////////////
+                                 _MM_HINT_T0);
 #endif
                     if (!(visited_array[candidate_id] == visited_array_tag))
                     {
@@ -1242,7 +1242,7 @@ namespace hnswlib
 
             tableint currObj = enterpoint_node_;
             dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-             this->budgets += dim_;
+            this->budgets += dim_;
 
             for (int level = maxlevel_; level > 0; level--)
             {
